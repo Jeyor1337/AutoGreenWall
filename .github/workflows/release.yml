@@ -1,0 +1,58 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for the release (e.g., v1.0.1)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: autogreenwall-linux
+            output_name: autogreenwall
+          - os: windows-latest
+            artifact_name: autogreenwall-windows
+            output_name: autogreenwall.exe
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Compile application
+      run: gcc -o2 -o ${{ matrix.output_name }} auto_greenwall.c
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: ${{ matrix.output_name }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create Release and Upload Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ inputs.tag }} \
+            --generate-notes \
+            --title "Release ${{ inputs.tag }}" \
+            artifacts/autogreenwall-linux/autogreenwall \
+            artifacts/autogreenwall-windows/autogreenwall.exe
