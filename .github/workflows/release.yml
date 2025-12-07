@@ -26,8 +26,23 @@ jobs:
     - name: Check out code
       uses: actions/checkout@v4
 
-    - name: Compile application
-      run: gcc -o ${{ matrix.output_name }} auto_greenwall.c
+    - name: Install libgit2 (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: sudo apt-get update && sudo apt-get install -y libgit2-dev
+
+    - name: Install libgit2 (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        C:\vcpkg\vcpkg install libgit2:x64-windows
+        echo "LIBGIT2_PATH=C:\vcpkg\installed\x64-windows" >> $GITHUB_ENV
+
+    - name: Compile application (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: gcc -o ${{ matrix.output_name }} auto_greenwall.c -lgit2
+
+    - name: Compile application (Windows)
+      if: matrix.os == 'windows-latest'
+      run: gcc -o ${{ matrix.output_name }} auto_greenwall.c -I"$env:LIBGIT2_PATH\include" -L"$env:LIBGIT2_PATH\lib" -lgit2 -lws2_32
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4

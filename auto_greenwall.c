@@ -4,6 +4,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <stdarg.h>
+#include <git2.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -20,15 +21,17 @@ int is_quiet = 1;
 void log_msg(const char *format, ...);
 void getUserSettings(int *d_mode, int *p, int *min_c, int *max_c);
 int prompt_for_int(const char *prompt, int min, int max);
-void exec_cmd(const char *command);
 int path_exists(const char *path);
-void set_git_env(const char *key, const char *value);
+int create_commit(git_repository *repo, const char *content, const char *message,
+                  const char *author_name, const char *author_email, time_t commit_time);
 
 int main(int argc, char *argv[])
 {
     if (argc > 1 && (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--verbose"))) {
         is_quiet = 0;
     }
+
+    git_libgit2_init();
 
     int date_mode, commit_prob, min_c, max_c;
     getUserSettings(&date_mode, &commit_prob, &min_c, &max_c);
@@ -38,16 +41,31 @@ int main(int argc, char *argv[])
     if (!path_exists("./contribution-data-c")) {
         log_msg("Directory not found. Creating './contribution-data-c'...\n");
         if (MKDIR("./contribution-data-c") != 0) {
-            fprintf(stderr, "[FATAL] Failed to create directory.\n"); return 1;
+            fprintf(stderr, "[FATAL] Failed to create directory.\n");
+            git_libgit2_shutdown();
+            return 1;
         }
     }
     if (CHDIR("./contribution-data-c") != 0) {
-        fprintf(stderr, "[FATAL] Failed to change directory.\n"); return 1;
+        fprintf(stderr, "[FATAL] Failed to change directory.\n");
+        git_libgit2_shutdown();
+        return 1;
     }
 
+    git_repository *repo = NULL;
     if (!path_exists(".git")) {
         log_msg("No git repo found. Initializing...\n");
-        exec_cmd("git init");
+        if (git_repository_init(&repo, ".", 0) != 0) {
+            fprintf(stderr, "[FATAL] Failed to initialize repository: %s\n", git_error_last()->message);
+            git_libgit2_shutdown();
+            return 1;
+        }
+    } else {
+        if (git_repository_open(&repo, ".") != 0) {
+            fprintf(stderr, "[FATAL] Failed to open repository: %s\n", git_error_last()->message);
+            git_libgit2_shutdown();
+            return 1;
+        }
     }
 
     time_t now = time(NULL);
@@ -76,7 +94,7 @@ int main(int argc, char *argv[])
 
     struct tm current_dt = start_dt;
     long commits_done = 0;
-    char cmd_buf[512], date_buf[64];
+    char msg_buf[256], date_buf[64], content_buf[128];
 
     while (mktime(&current_dt) <= end_time_t)
     {
@@ -90,23 +108,25 @@ int main(int argc, char *argv[])
                 commit_time.tm_hour = 9 + (rand() % 12);
                 commit_time.tm_min = rand() % 60;
                 commit_time.tm_sec = rand() % 60;
+                time_t commit_timestamp = mktime(&commit_time);
+
                 strftime(date_buf, sizeof(date_buf), "%Y-%m-%dT%H:%M:%S", &commit_time);
+                snprintf(content_buf, sizeof(content_buf), "update %s", date_buf);
+                snprintf(msg_buf, sizeof(msg_buf), "sync: task %d for %d-%02d-%02d",
+                         i + 1, commit_time.tm_year + 1900, commit_time.tm_mon + 1, commit_time.tm_mday);
 
-                set_git_env("GIT_AUTHOR_DATE", date_buf);
-                set_git_env("GIT_COMMITTER_DATE", date_buf);
-
-                FILE *fp = fopen("activity.log", "w");
-                if (fp) { fprintf(fp, "update %s", date_buf); fclose(fp); }
-
-                exec_cmd("git add activity.log");
-                snprintf(cmd_buf, 512, "git commit -m \"sync: task %d for %d-%02d-%02d\"", i + 1, commit_time.tm_year + 1900, commit_time.tm_mon + 1, commit_time.tm_mday);
-                exec_cmd(cmd_buf);
+                if (create_commit(repo, content_buf, msg_buf, "AutoGreenWall", "auto@greenwall.local", commit_timestamp) != 0) {
+                    fprintf(stderr, "[WARN] Failed to create commit for %s\n", date_buf);
+                    continue;
+                }
                 commits_done++;
             }
         }
         current_dt.tm_mday++;
         mktime(&current_dt);
     }
+
+    git_repository_free(repo);
     
     printf("\nOperation completed.\n");
     printf("Total commits created: %ld\n", commits_done);
@@ -115,6 +135,8 @@ int main(int argc, char *argv[])
     printf("  2. git remote add origin <your-github-repo-url>\n");
     printf("  3. git branch -M main\n");
     printf("  4. git push -u origin main\n");
+
+    git_libgit2_shutdown();
     return 0;
 }
 
@@ -147,32 +169,87 @@ int prompt_for_int(const char *prompt, int min, int max) {
     }
 }
 
-void exec_cmd(const char *command)
-{
-    char final_cmd[512];
-    const char *redir = "";
-    if (is_quiet) {
-#ifdef _WIN32
-        redir = " > NUL 2>&1";
-#else
-        redir = " > /dev/null 2>&1";
-#endif
-    }
-    snprintf(final_cmd, sizeof(final_cmd), "%s%s", command, redir);
-    if (system(final_cmd) != 0) {
-        fprintf(stderr, "  [WARN] Command failed: %s\n", command);
-    }
-}
-
 int path_exists(const char *path) {
     struct stat info;
     return stat(path, &info) == 0 && (info.st_mode & S_IFDIR);
 }
 
-void set_git_env(const char *key, const char *value) {
-#ifdef _WIN32
-    _putenv_s(key, value);
-#else
-    setenv(key, value, 1);
-#endif
+int create_commit(git_repository *repo, const char *content, const char *message,
+                  const char *author_name, const char *author_email, time_t commit_time)
+{
+    int error = 0;
+    git_oid tree_id, commit_id, blob_id;
+    git_tree *tree = NULL;
+    git_signature *sig = NULL;
+    git_index *index = NULL;
+    git_reference *head_ref = NULL;
+    git_commit *parent_commit = NULL;
+    const git_commit *parents[1];
+    size_t parent_count = 0;
+
+    // Create signature with custom timestamp
+    if ((error = git_signature_new(&sig, author_name, author_email, commit_time, 0)) < 0) {
+        goto cleanup;
+    }
+
+    // Create blob from content
+    if ((error = git_blob_create_frombuffer(&blob_id, repo, content, strlen(content))) < 0) {
+        goto cleanup;
+    }
+
+    // Get index and add blob to it
+    if ((error = git_repository_index(&index, repo)) < 0) {
+        goto cleanup;
+    }
+
+    git_index_entry entry = {0};
+    entry.mode = GIT_FILEMODE_BLOB;
+    entry.id = blob_id;
+    entry.path = "activity.log";
+
+    if ((error = git_index_add(index, &entry)) < 0) {
+        goto cleanup;
+    }
+
+    // Write tree
+    if ((error = git_index_write_tree(&tree_id, index)) < 0) {
+        goto cleanup;
+    }
+
+    if ((error = git_tree_lookup(&tree, repo, &tree_id)) < 0) {
+        goto cleanup;
+    }
+
+    // Get parent commit if exists
+    error = git_reference_name_to_id(&commit_id, repo, "HEAD");
+    if (error == 0) {
+        if ((error = git_commit_lookup(&parent_commit, repo, &commit_id)) == 0) {
+            parents[0] = parent_commit;
+            parent_count = 1;
+        }
+    }
+    error = 0;  // Reset error as HEAD might not exist on first commit
+
+    // Create commit
+    if ((error = git_commit_create(&commit_id, repo, "HEAD", sig, sig, NULL,
+                                    message, tree, parent_count, parents)) < 0) {
+        goto cleanup;
+    }
+
+    // Write index to disk
+    git_index_write(index);
+
+cleanup:
+    if (parent_commit) git_commit_free(parent_commit);
+    if (tree) git_tree_free(tree);
+    if (index) git_index_free(index);
+    if (head_ref) git_reference_free(head_ref);
+    if (sig) git_signature_free(sig);
+
+    if (error < 0) {
+        const git_error *e = git_error_last();
+        log_msg("  [ERROR] %s\n", e ? e->message : "unknown error");
+    }
+
+    return error;
 }
